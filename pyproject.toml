@@ -1,0 +1,10 @@
+[project]
+name = "challenge-48h-b3"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dash>=3.0.4",
+    "paho-mqtt>=2.1.0",
+]
