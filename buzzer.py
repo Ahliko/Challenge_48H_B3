@@ -12,12 +12,18 @@ class Buzzer:
         self.pin.duty_u16(0)
 
     def __on(self):
-        self.pin.duty_u16(1000)
+        self.pin.duty_u16(self.freq)
 
     async def beep(self, duration):
         self.__on()
         await asyncio.sleep(duration)
         self.__off()
+
+    def _Buzzer__off(self):
+        self.pin.duty_u16(0)
+
+    def _Buzzer__on(self):
+        self.pin.duty_u16(self.freq)
 
     @property
     def freq(self):

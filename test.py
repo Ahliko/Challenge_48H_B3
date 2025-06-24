@@ -1,4 +1,4 @@
-from machine import ADC, Pin, unique_id
+from machine import ADC, Pin, unique_id, Timer
 import time
 import network
 
@@ -24,6 +24,7 @@ etat_porte = "Fermée"
 dernier_etat_publie = ""
 alarme_activee = False
 alarme_en_alerte = False
+intrusion_detectee = False  # Nouvelle variable pour l'état d'intrusion
 code_alarme = "1234"
 temps_ouverture = 0
 delai_alerte = 10
@@ -32,6 +33,90 @@ code_saisi = ""
 
 buzzer = Buzzer(13)
 pave = Pave(buzzer=buzzer)
+
+# Variables pour les timers et interruptions
+timer_alerte = Timer(0)
+timer_buzzer = Timer(1)
+timer_led = Timer(2)
+timer_adc = Timer(3)
+
+led_alerte_state = False
+buzzer_alerte_state = False
+buzzer_pattern_step = 0
+
+def interrupt_lecture_porte(timer):
+    global etat_porte
+    try:
+        valeur = adc.read()
+        if valeur > 3500:
+            etat_porte = "Fermée"
+        else:
+            etat_porte = "Ouverte"
+    except:
+        pass
+
+def interrupt_led_alerte(timer):
+    global led_alerte_state
+    if alarme_en_alerte or intrusion_detectee:
+        led_alerte_state = not led_alerte_state
+        led_rouge.value(led_alerte_state)
+
+def interrupt_buzzer_alerte(timer):
+    global buzzer_alerte_state, buzzer_pattern_step
+    if alarme_en_alerte or intrusion_detectee:
+        if buzzer_pattern_step == 0:
+            buzzer.freq = 2000
+            buzzer._Buzzer__on()
+            buzzer_pattern_step = 1
+        elif buzzer_pattern_step == 1:
+            buzzer._Buzzer__off()
+            buzzer_pattern_step = 2
+        elif buzzer_pattern_step == 2:
+            buzzer.freq = 1800
+            buzzer._Buzzer__on()
+            buzzer_pattern_step = 3
+        else:
+            buzzer._Buzzer__off()
+            buzzer_pattern_step = 0
+
+def interrupt_timeout_alerte(timer):
+    global alarme_en_alerte, intrusion_detectee
+    if alarme_activee and etat_porte == "Ouverte":
+        alarme_en_alerte = True
+        intrusion_detectee = True
+        print("🚨 ALERTE ! Intrusion détectée - L'alarme continuera même si la porte se ferme !")
+        timer_led.init(period=100, mode=Timer.PERIODIC, callback=interrupt_led_alerte)
+        timer_buzzer.init(period=150, mode=Timer.PERIODIC, callback=interrupt_buzzer_alerte)
+
+def demarrer_alerte_imminente():
+    print("⚠️ Porte ouverte - Vous avez 10 secondes pour la fermer !")
+    timer_alerte.init(period=delai_alerte*1000, mode=Timer.ONE_SHOT, callback=interrupt_timeout_alerte)
+
+def arreter_alerte_sans_intrusion():
+    """Arrête l'alerte seulement si aucune intrusion n'a été détectée"""
+    global alarme_en_alerte
+    if not intrusion_detectee:
+        alarme_en_alerte = False
+        timer_alerte.deinit()
+        timer_led.deinit()
+        timer_buzzer.deinit()
+        led_rouge.value(0)
+        buzzer._Buzzer__off()
+        print("✅ Porte fermée à temps - Alerte annulée")
+
+def arreter_alerte_complete():
+    """Arrête complètement l'alerte (utilisé lors de la désactivation de l'alarme)"""
+    global alarme_en_alerte, intrusion_detectee, buzzer_pattern_step
+    alarme_en_alerte = False
+    intrusion_detectee = False
+    buzzer_pattern_step = 0
+    timer_alerte.deinit()
+    timer_led.deinit()
+    timer_buzzer.deinit()
+    led_rouge.value(0)
+    buzzer._Buzzer__off()
+
+timer_adc.init(period=100, mode=Timer.PERIODIC, callback=interrupt_lecture_porte)
 
 def connecter_wifi():
     wlan = network.WLAN(network.STA_IF)
@@ -94,47 +179,30 @@ async def son_alerte_imminente():
         await buzzer.beep(0.1)
         await asyncio.sleep_ms(200)
 
-async def son_alerte_continue():
-    while alarme_en_alerte:
-        buzzer.freq = 2000
-        await buzzer.beep(0.3)
-        await asyncio.sleep_ms(100)
-        buzzer.freq = 1800
-        await buzzer.beep(0.3)
-        await asyncio.sleep_ms(100)
-
 async def gerer_alarme():
-    global alarme_activee, alarme_en_alerte, etat_porte, temps_ouverture
+    global alarme_activee, temps_ouverture
+    etat_precedent = etat_porte
 
     while True:
-        if alarme_activee and etat_porte == "Ouverte" and not alarme_en_alerte:
-            if temps_ouverture == 0:
-                temps_ouverture = time.time()
-                print("⚠️ Porte ouverte - Délai de 10s avant alerte")
-                asyncio.create_task(son_alerte_imminente())
-            elif time.time() - temps_ouverture >= delai_alerte:
-                alarme_en_alerte = True
-                print("🚨 ALERTE ! Intrusion détectée !")
-                asyncio.create_task(clignoter_alerte())
-                asyncio.create_task(son_alerte_continue())
+        # Démarrage du délai d'alerte lors de l'ouverture
+        if alarme_activee and etat_porte == "Ouverte" and etat_precedent == "Fermée" and not alarme_en_alerte and not intrusion_detectee:
+            temps_ouverture = time.time()
+            asyncio.create_task(son_alerte_imminente())
+            demarrer_alerte_imminente()
 
-        elif etat_porte == "Fermée":
-            temps_ouverture = 0
-            if alarme_en_alerte:
-                alarme_en_alerte = False
-                print("Porte fermée - Alerte annulée")
+        # Annulation de l'alerte SEULEMENT si aucune intrusion n'a été détectée
+        elif etat_porte == "Fermée" and etat_precedent == "Ouverte" and alarme_activee:
+            if not intrusion_detectee:
+                arreter_alerte_sans_intrusion()
+                temps_ouverture = 0
+            else:
+                print("⚠️ Porte fermée mais intrusion détectée - L'alarme continue !")
 
-        await asyncio.sleep_ms(100)
-
-async def clignoter_alerte():
-    while alarme_en_alerte:
-        led_rouge.value(1)
-        await asyncio.sleep_ms(100)
-        led_rouge.value(0)
-        await asyncio.sleep_ms(100)
+        etat_precedent = etat_porte
+        await asyncio.sleep_ms(200)
 
 async def gerer_pave():
-    global alarme_activee, alarme_en_alerte, code_alarme, saisie_code_en_cours, code_saisi
+    global alarme_activee, code_alarme, saisie_code_en_cours, code_saisi
 
     while True:
         try:
@@ -146,7 +214,6 @@ async def gerer_pave():
                 if touche == 'F' and not saisie_code_en_cours:
                     if not alarme_activee:
                         alarme_activee = True
-                        alarme_en_alerte = False
                         print("🔒 Alarme ACTIVÉE")
                         await clignoter_led(led_verte, 3, 150)
                         await son_activation()
@@ -158,17 +225,18 @@ async def gerer_pave():
                         saisie_code_en_cours = True
                         code_saisi = touche
                         print(f"Saisie du code: {'*' * len(code_saisi)}")
-                        await asyncio.sleep(0.3)
+                        await clignoter_led(led_verte, 1, 150)
                     elif saisie_code_en_cours:
                         code_saisi += touche
                         print(f"Saisie du code: {'*' * len(code_saisi)}")
+                        await clignoter_led(led_verte, 1, 150)
 
                         if len(code_saisi) >= 4:
                             if code_saisi == code_alarme:
                                 alarme_activee = False
-                                alarme_en_alerte = False
                                 saisie_code_en_cours = False
-                                print("🔓 Alarme DÉSACTIVÉE")
+                                arreter_alerte_complete()  # Arrête complètement l'alerte
+                                print("🔓 Alarme DÉSACTIVÉE - Système réinitialisé")
                                 await clignoter_led(led_verte, 5, 100)
                                 await son_desactivation()
                             else:
@@ -178,7 +246,6 @@ async def gerer_pave():
                                 buzzer.freq = 300
                                 await buzzer.beep(0.5)
                             code_saisi = ""
-                        await asyncio.sleep(0.3)
 
                 elif touche == 'C' and saisie_code_en_cours:
                     saisie_code_en_cours = False
@@ -188,9 +255,9 @@ async def gerer_pave():
                 elif touche == 'E' and saisie_code_en_cours:
                     if code_saisi == code_alarme:
                         alarme_activee = False
-                        alarme_en_alerte = False
                         saisie_code_en_cours = False
-                        print("🔓 Alarme DÉSACTIVÉE")
+                        arreter_alerte_complete()  # Arrête complètement l'alerte
+                        print("🔓 Alarme DÉSACTIVÉE - Système réinitialisé")
                         await clignoter_led(led_verte, 5, 100)
                         await son_desactivation()
                     else:
@@ -205,20 +272,13 @@ async def gerer_pave():
             print(f"Erreur pavé numérique: {e}")
             await asyncio.sleep_ms(100)
 
-async def surveiller_porte():
-    global etat_porte, dernier_etat_publie, mqtt_client
+async def surveiller_mqtt():
+    global dernier_etat_publie, mqtt_client
 
     while True:
         try:
-            valeur = adc.read()
-            tension = valeur * 3.3 / 4095
-
-            if valeur > 3500:
-                etat_porte = "Fermée"
-            else:
-                etat_porte = "Ouverte"
-
-            if not alarme_en_alerte:
+            # Gestion des LEDs (sauf pendant l'alerte)
+            if not alarme_en_alerte and not intrusion_detectee:
                 if etat_porte == "Fermée":
                     led_verte.value(1)
                     led_rouge.value(0)
@@ -236,7 +296,9 @@ async def surveiller_porte():
                     etat_complet = etat_porte
                     if alarme_activee:
                         etat_complet += " - Alarme: ON"
-                        if alarme_en_alerte:
+                        if intrusion_detectee:
+                            etat_complet += " - INTRUSION DÉTECTÉE!"
+                        elif alarme_en_alerte:
                             etat_complet += " - ALERTE!"
                     else:
                         etat_complet += " - Alarme: OFF"
@@ -251,6 +313,7 @@ async def surveiller_porte():
                         dernier_etat_publie = etat_complet
 
             except Exception as e:
+                print(etat_complet)
                 print(f"Erreur MQTT: {e}")
                 mqtt_client = connecter_mqtt()
 
@@ -258,13 +321,18 @@ async def surveiller_porte():
             await asyncio.sleep_ms(500)
 
         except Exception as e:
-            print(f"Erreur surveillance porte: {e}")
+            print(f"Erreur surveillance: {e}")
             await asyncio.sleep_ms(1000)
 
 async def main():
     global mqtt_client
 
     print("=== Système de surveillance avec alarme ===")
+    print("Comportement de l'alarme:")
+    print("- Délai de 10s pour fermer la porte avant alerte")
+    print("- Si intrusion détectée, l'alarme continue même porte fermée")
+    print("- Seul le code correct peut arrêter l'alarme après intrusion")
+    print()
     print("Commandes pavé numérique:")
     print("- F: Activer l'alarme")
     print("- 0-9: Saisir le code pour désactiver")
@@ -283,12 +351,17 @@ async def main():
 
     try:
         await asyncio.gather(
-            surveiller_porte(),
+            surveiller_mqtt(),
             gerer_pave(),
             gerer_alarme()
         )
     except Exception as e:
         print(f"Erreur dans main: {e}")
+    finally:
+        timer_adc.deinit()
+        timer_alerte.deinit()
+        timer_led.deinit()
+        timer_buzzer.deinit()
 
 if __name__ == "__main__":
     try:
